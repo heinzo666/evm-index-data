@@ -8,7 +8,13 @@ Outputs per-shard ndjson + STATUS heartbeat in --outdir.
 """
 import argparse, json, os, sys, time, threading, random, itertools
 from concurrent.futures import ThreadPoolExecutor
-import urllib.request, urllib.error
+import urllib.request, urllib.error, ssl
+_SSLCtx = ssl.create_default_context()
+try:
+    _SSLCtx.check_hostname = False
+    _SSLCtx.verify_mode = ssl.CERT_NONE
+except Exception:
+    pass
 
 # ---------------------------------------------------------------- keccak256
 _MASK = (1 << 64) - 1
@@ -209,7 +215,8 @@ def _pick_url(ch):
         for u in lst[:1]: _COOL[u] = now + 30
     return alive[idx % len(alive)]
 
-def rpc_batch(ch, items, timeout=12, tries=3):
+LASTERR={"t":""}
+def rpc_batch(ch, items, timeout=14, tries=3):
     """items=[(method,params),...] -> aligned list or None."""
     flat = [{"jsonrpc":"2.0","id":i,"method":m,"params":p} for i,(m,p) in enumerate(items)]
     body = json.dumps(flat if len(flat)>1 else flat[0]).encode()
@@ -219,8 +226,11 @@ def rpc_batch(ch, items, timeout=12, tries=3):
         if not url: return None
         _take(max(1,len(items)//3))
         try:
-            req = urllib.request.Request(url, data=body, headers={"Content-Type":"application/json"}, method="POST")
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            req = urllib.request.Request(url, data=body,
+                headers={"Content-Type":"application/json",
+                         "User-Agent":"curl/8.4.0","Accept":"application/json,*/*"},
+                method="POST")
+            with urllib.request.urlopen(req, timeout=timeout, context=_SSLCtx) as resp:
                 txt = resp.read().decode(errors="ignore")
             arr = json.loads(txt)
             if isinstance(arr, dict): arr = [arr]
@@ -242,6 +252,7 @@ def rpc_batch(ch, items, timeout=12, tries=3):
             return outs
         except Exception as ex:
             last = ex
+            LASTERR["t"]=repr(ex)[:140]
             with _LOCK:
                 _FAIL[url] = _FAIL.get(url,0)+1
                 if _FAIL[url] >= 4: _COOL[url] = time.time()+45; _FAIL[url] = 0
@@ -483,7 +494,7 @@ def main():
         open(hbf,"w").write(f"{int(time.time())}\n")
         open(statf,"w").write(
           f"processed={tot}/{len(todo)} pass={STATE['pass']} near={STATE['near']} unres={STATE['unres']} "
-          f"rate={rate:.2f}/s eta_s={eta} errs={_STATS['err']} {msg}\n")
+          f"rate={rate:.2f}/s eta_s={eta} errs={_STATS['err']} lasterr={LASTERR['t'][:90]} {msg}\n")
     def hb():
         while not stop["v"]:
             time.sleep(25)

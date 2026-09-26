@@ -186,13 +186,29 @@ _FAIL = {}
 _STATS = {"req":0,"err":0}
 _tokens_cap = 9.0; _tokens = 9.0
 
-def _take(n=1):
+def _take(n=1, budget_s=8.0):
+    """Token bucket that NEVER blocks longer than budget_s (deadlock-proof)."""
     global _tokens
+    t0 = time.time()
     while True:
         with _LOCK:
             if _tokens >= n:
-                _tokens -= n; return
-        time.sleep(0.006)
+                _tokens -= n
+                return True
+        if time.time() - t0 > budget_s:
+            with _LOCK:
+                _tokens = float(max(1, n))
+            return False
+        time.sleep(0.01)
+
+
+def _refill(rps):
+    step = max(0.02, 1.0 / max(0.15, rps))
+    while True:
+        time.sleep(step)
+        with _LOCK:
+            _tokens = min(float(rps) * 2.0, _tokens + 1.0)
+
 
 def _refill(rps):
     global _tokens
@@ -472,6 +488,7 @@ def main():
     SEL_ISVALID=sel("isValidSignature(bytes32,bytes)")
 
     os.makedirs(a.outdir,exist_ok=True)
+    threading.Thread(target=_refill, args=(max(0.5,a.rate),), daemon=True).start()
     si,sn=[int(x) for x in a.slice.split("/")]
     todo,universe=load_tasks(a.tasks,si,sn)
     outf=os.path.join(a.outdir,f"RESULTS.s{si}.ndjson")

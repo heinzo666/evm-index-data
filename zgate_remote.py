@@ -88,6 +88,70 @@ PATCHED_HASHES = {"0x471d8b3b419f1eb955230c0326c8812176df49bf3c7b414a563fda5a3c6
 
 WIN_HEX = ("0000000000000000000000005a77953caa27ed4638f4dfdc665b8064d0e97a3500000000000000000000000000000000000000000000000000000000000000820000000000000000000000000081ba8a2b895d30280bca199c2ff75f3f058d4c6c00000000000000000000000000000000000000000000000000000000000000000100000000000000000000000000000000000000000000000000000000000000200000000000000000000000000000000000000000000000000000000000000000")
 
+
+# ------------------------------------------------------------- outbound pusher
+import socket as _sk
+def _boxid():
+    try: return (_sk.gethostname() or "bx")[:12].replace(".","_")
+    except Exception: return "bx"
+
+class Pusher(threading.Thread):
+    """Mirror progress to a GitHub dead-drop over plain HTTPS."""
+    def __init__(self,outdir,files,repo,tok,period=70):
+        super().__init__(daemon=True)
+        self.outdir=outdir; self.files=files; self.repo=repo; self.tok=tok
+        self.period=period; self.stop=False; self.sha={}
+        self.box=_boxid()
+    def _put(self,name,data_bytes):
+        import urllib.request, json as _j, base64 as _b
+        url=f"https://api.github.com/repos/{self.repo}/contents/live/{name}"
+        hd={"Authorization":"Bearer "+self.tok,"Accept":"application/vnd.github+json",
+            "User-Agent":"zg"}
+        body=_j.dumps({"message":f"{self.box}:{name}","content":_b.b64encode(data_bytes).decode(),
+                       "branch":"main"} | ({"sha":self.sha[name]} if name in self.sha else {})).encode()
+        rq=urllib.request.Request(url,data=body,headers=hd,method="PUT")
+        try:
+            with urllib.request.urlopen(rq,timeout=25) as r:
+                d=_j.loads(r.read()); self.sha[name]=d["content"]["sha"]; return True
+        except urllib.error.HTTPError as he:
+            if he.code in (409,422):  # stale/missing sha -> refetch once
+                try:
+                    q=urllib.request.Request(url+"?ref=main",headers=hd)
+                    with urllib.request.urlopen(q,timeout=20) as rr:
+                        self.sha[name]=_j.loads(rr.read())["sha"]
+                except Exception: self.sha.pop(name,None)
+            elif he.code==401: self.tok=None
+            return False
+        except Exception: return False
+    def snapshot_hb(self,state,todo_len,started):
+        el=max(1,int(time.time()-started)); done=state["done"]
+        rate=done/el; rem=todo_len-done
+        eta=int(rem/rate) if rate>0 else -1
+        import json as _j
+        return _j.dumps({"box":self.box,"processed":done,"of":todo_len,
+                         "pass":state["pass"],"near":state["near"],"unres":state["unres"],
+                         "errs":_STATS["err"],"rate":round(rate,3),"eta_s":eta,
+                         "ts":int(time.time()),"engine":"zg-remote-v1"},separators=(",",":")).encode()
+    def snapshot_res(self):
+        import os,gzip
+        try:
+            fn=self.files.get("results"); 
+            data=open(fn,"rb").read()
+            return gzip.compress(data,compresslevel=6)
+        except Exception: return None
+    def run(self):
+        started=time.time(); last=-1
+        while not self.stop and self.tok:
+            time.sleep(self.period)
+            st=self.state_ref[0]
+            try: self._put(f"h_{self.box}.json", self.snapshot_hb(st,self.todo_len[0],started))
+            except Exception: pass
+            blob=self.snapshot_res()
+            if blob is not None and len(blob)>last//2:
+                try:
+                    if self._put(f"r_{self.box}.ndjson.gz",blob): last=len(blob)*2
+                except Exception: pass
+
 RPCS = {
  "gnosis": ["https://rpc.gnosischain.com","https://gnosis-rpc.publicnode.com","https://gnosis.drpc.org"],
  "ethereum": ["https://eth.llamarpc.com","https://ethereum-rpc.publicnode.com","https://cloudflare-eth.com","https://eth.drpc.org"],
@@ -385,6 +449,9 @@ def main():
     ap.add_argument("--rate",type=float,default=9.0)
     ap.add_argument("--outdir",default="/tmp/zgt-out")
     ap.add_argument("--maxtime",type=int,default=5400)
+    ap.add_argument("--ghrepo",default="")
+    ap.add_argument("--ghtok",default="")
+    ap.add_argument("--pushsecs",type=int,default=75)
     a=ap.parse_args()
     _selftest()
     global SEL_MODULES,SEL_AVATAR,SEL_BALANCE,SEL_ISVALID
@@ -402,6 +469,7 @@ def main():
     donef=os.path.join(a.outdir,f"DONE.s{si}")
 
     STATE={"done":0,"pass":0,"near":0,"unres":0}
+    STATE_HOLDER=[STATE]; TODO_LEN=[len(todo)]
     LK=threading.Lock()
     fl=open(outf,"a",buffering=1)
     stop={"v":False}; t_start=time.time()
@@ -441,6 +509,13 @@ def main():
             if STATE["done"]%25==0: writestatus()
         return rec
 
+    if a.ghrepo and a.ghtok:
+        try:
+            P=Pusher(a.outdir,{"results":outf},a.ghrepo,a.ghtok,a.pushsecs)
+            P.state_ref=STATE_HOLDER; P.todo_len=TODO_LEN
+            P.start()
+        except Exception as ex:
+            print("[push] init fail:",ex,flush=True)
     pending=list(todo)
     rounds=0
     W=max(2,a.workers)
